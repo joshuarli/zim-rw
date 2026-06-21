@@ -9,6 +9,7 @@ pub(crate) const HEADER_LEN: usize = 80;
 pub const NAMESPACE_CONTENT: u8 = b'C';
 pub const NAMESPACE_METADATA: u8 = b'M';
 pub const NAMESPACE_WELL_KNOWN: u8 = b'W';
+pub const NAMESPACE_LISTING: u8 = b'X';
 
 pub(crate) const COMP_NONE: u8 = 1;
 pub(crate) const COMP_XZ: u8 = 4;

@@ -1,7 +1,7 @@
 use crate::codec::{is_text_mime, zstd_encode};
 use crate::format::{
-    md5, put_u16, put_u32, put_u64, Header, COMP_NONE, COMP_ZSTD, HEADER_LEN, NAMESPACE_METADATA,
-    NO_MAIN_PAGE, REDIRECT_ENTRY,
+    md5, put_u16, put_u32, put_u64, Header, COMP_NONE, COMP_ZSTD, HEADER_LEN, NAMESPACE_LISTING,
+    NAMESPACE_METADATA, NO_MAIN_PAGE, REDIRECT_ENTRY,
 };
 use crate::reader::make_key as key;
 use crate::{Error, Result};
@@ -234,6 +234,21 @@ impl Writer {
         });
     }
 
+    /// Adds a PNG illustration (favicon) at the conventional metadata key.
+    ///
+    /// The key is `Illustration_{width}x{height}@{scale}` with MIME `image/png`.
+    /// Re-adding the same key replaces the prior bytes.
+    pub fn add_illustration(
+        &mut self,
+        width: u32,
+        height: u32,
+        scale: u32,
+        png: impl Into<Vec<u8>>,
+    ) {
+        let name = format!("Illustration_{width}x{height}@{scale}");
+        self.add_metadata_bytes(name, "image/png", png);
+    }
+
     /// Adds a redirect from `(namespace, url)` to `(target_namespace, target_url)`.
     pub fn add_redirect(
         &mut self,
@@ -461,6 +476,57 @@ impl Writer {
     }
 
     fn build_plan_metadata(&mut self) -> Result<(PlanMetadata, Vec<ClusterEntry>)> {
+        // Auto-generate X/listing/titleOrdered/v1 first so M/Counter counts it
+        let listing_key = key(NAMESPACE_LISTING, "listing/titleOrdered/v1");
+        if !self.by_key.contains_key(&listing_key) {
+            let mut titles: Vec<(&str, &str)> = self
+                .entries
+                .iter()
+                .filter(|e| !e.redirect)
+                .map(|e| (e.title.as_str(), e.url.as_str()))
+                .collect();
+            titles.sort_by(|a, b| a.0.cmp(b.0));
+            let mut body = String::new();
+            for (title, _url) in &titles {
+                use std::fmt::Write;
+                let _ = writeln!(body, "{title}");
+            }
+            self.put(WriterEntry {
+                namespace: NAMESPACE_LISTING,
+                url: "listing/titleOrdered/v1".into(),
+                title: "Title Ordered Listing".into(),
+                mime: "text/plain".into(),
+                data: body.into_bytes(),
+                data_len: 0,
+                redirect: false,
+                target_key: String::new(),
+                mime_idx: 0,
+                cluster: 0,
+                blob: 0,
+                target_index: 0,
+                url_index: 0,
+                position: 0,
+            });
+        }
+
+        // Auto-generate M/Counter (after listing so it's included in counts)
+        if !self.by_key.contains_key(&key(NAMESPACE_METADATA, "Counter")) {
+            let mut counts: FxHashMap<&str, u32> = FxHashMap::default();
+            for e in &self.entries {
+                if !e.redirect && !e.mime.is_empty() {
+                    *counts.entry(&e.mime).or_insert(0) += 1;
+                }
+            }
+            let mut keys: Vec<&&str> = counts.keys().collect();
+            keys.sort();
+            let mut body = String::new();
+            for k in keys {
+                use std::fmt::Write;
+                let _ = writeln!(body, "{k}={}", counts[k]);
+            }
+            self.add_metadata("Counter", body);
+        }
+
         let mut plan = PlanMetadata::default();
         let mut ents = self.entries.clone();
         ents.sort_by_key(|a| key(a.namespace, &a.url));

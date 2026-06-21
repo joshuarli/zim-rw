@@ -128,7 +128,7 @@ fn magic_and_header() {
     let main_page = u32::from_le_bytes(data[64..68].try_into().unwrap());
     let checksum_pos = u64::from_le_bytes(data[72..80].try_into().unwrap());
     assert_eq!(checksum_pos, (data.len() - 16) as u64);
-    assert_eq!(article_count, 6);
+    assert_eq!(article_count, 8); // 3 content + 2 metadata + 1 redirect + Counter + listing
     assert_ne!(main_page, u32::MAX);
 }
 
@@ -175,7 +175,7 @@ fn duplicate_content_replaces_previous_entry() {
     w.write_to(&mut data).expect("write archive");
     let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("new reader");
 
-    assert_eq!(r.count(), 1);
+    assert_eq!(r.count(), 3); // 1 content + Counter + listing
     let blob = r.get(NAMESPACE_CONTENT, "same").expect("get blob");
     assert_eq!(blob.title, "New");
     assert_eq!(blob.data, b"new");
@@ -240,14 +240,24 @@ fn reads_extended_cluster_offsets() {
     w.write_to(&mut data).expect("write archive");
 
     let cluster_ptr_pos = u64::from_le_bytes(data[48..56].try_into().unwrap()) as usize;
-    let cluster_pos = u64::from_le_bytes(
+    // Read the first two cluster pointers to get cluster 0 bounds
+    let c0_start = u64::from_le_bytes(
         data[cluster_ptr_pos..cluster_ptr_pos + 8]
             .try_into()
             .unwrap(),
     ) as usize;
-    let checksum_pos = u64::from_le_bytes(data[72..80].try_into().unwrap()) as usize;
-    let body = data[cluster_pos + 1..checksum_pos].to_vec();
-    assert_eq!(data[cluster_pos], 1);
+    let cluster_count = u32::from_le_bytes(data[28..32].try_into().unwrap());
+    let c0_end = if cluster_count > 1 {
+        u64::from_le_bytes(
+            data[cluster_ptr_pos + 8..cluster_ptr_pos + 16]
+                .try_into()
+                .unwrap(),
+        ) as usize
+    } else {
+        u64::from_le_bytes(data[72..80].try_into().unwrap()) as usize
+    };
+    let body = data[c0_start + 1..c0_end].to_vec();
+    assert_eq!(data[c0_start], 1);
     assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 8);
     assert_eq!(u32::from_le_bytes(body[4..8].try_into().unwrap()), 13);
 
@@ -257,8 +267,25 @@ fn reads_extended_cluster_offsets() {
     extended.extend_from_slice(&21u64.to_le_bytes());
     extended.extend_from_slice(&body[8..]);
 
-    data.splice(cluster_pos..checksum_pos, extended);
-    let new_checksum_pos = checksum_pos + 8;
+    let old_len = c0_end - c0_start;
+    let new_len = extended.len();
+    data.splice(c0_start..c0_end, extended);
+    let diff = new_len as i64 - old_len as i64;
+
+    // Update cluster pointer for cluster 1 onwards
+    if cluster_count > 1 {
+        for ci in 1..cluster_count as usize {
+            let ptr_off = cluster_ptr_pos + 8 * ci;
+            let old_pos = u64::from_le_bytes(
+                data[ptr_off..ptr_off + 8].try_into().unwrap(),
+            );
+            let new_pos = (old_pos as i64 + diff) as u64;
+            data[ptr_off..ptr_off + 8].copy_from_slice(&new_pos.to_le_bytes());
+        }
+    }
+
+    let checksum_pos = u64::from_le_bytes(data[72..80].try_into().unwrap()) as usize;
+    let new_checksum_pos = (checksum_pos as i64 + diff) as usize;
     data[72..80].copy_from_slice(&(new_checksum_pos as u64).to_le_bytes());
     let digest = md5::compute(&data[..new_checksum_pos]).0;
     data[new_checksum_pos..].copy_from_slice(&digest);
@@ -296,4 +323,79 @@ fn reads_old_zero_compression_as_uncompressed() {
     let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("new reader");
     let blob = r.get(NAMESPACE_CONTENT, "a").expect("get blob");
     assert_eq!(blob.data, b"alpha");
+}
+
+#[test]
+fn title_lookup_works() {
+    let mut w = Writer::new();
+    w.set_no_compress(true);
+    w.add_content(NAMESPACE_CONTENT, "index.html", "Home Page", "text/html", b"<h1>Home</h1>".to_vec());
+    w.add_content(NAMESPACE_CONTENT, "about.html", "About Us", "text/html", b"<h1>About</h1>".to_vec());
+    w.add_content(NAMESPACE_CONTENT, "contact.html", "Contact", "text/html", b"<h1>Contact</h1>".to_vec());
+
+    let mut data = Vec::new();
+    w.write_to(&mut data).expect("write");
+
+    let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("reader");
+
+    let blob = r.get_by_title(0, "About Us").expect("get_by_title");
+    assert_eq!(blob.url, "about.html");
+    assert_eq!(blob.data, b"<h1>About</h1>");
+
+    let blob = r.get_by_title(NAMESPACE_CONTENT, "Home Page").expect("namespace filtered");
+    assert_eq!(blob.url, "index.html");
+
+    let results = r.entries_by_title_prefix(0, "About").expect("prefix");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].url, "about.html");
+
+    let results = r.entries_by_title_prefix(0, "Z").expect("no match");
+    assert!(results.is_empty());
+
+    assert!(r.get_by_title(0, "Nonexistent").is_err());
+}
+
+#[test]
+fn counter_and_listing_are_generated() {
+    let mut w = Writer::new();
+    w.set_no_compress(true);
+    w.add_content(NAMESPACE_CONTENT, "a.html", "Alpha", "text/html", b"a".to_vec());
+    w.add_content(NAMESPACE_CONTENT, "b.png", "Beta", "image/png", b"b".to_vec());
+
+    let mut data = Vec::new();
+    w.write_to(&mut data).expect("write");
+
+    let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("reader");
+
+    // M/Counter should be auto-generated
+    let counter = r.get(NAMESPACE_METADATA, "Counter").expect("Counter");
+    let text = String::from_utf8_lossy(&counter.data);
+    assert!(text.contains("image/png=1"), "got: {text}");
+    assert!(text.contains("text/html=1"), "got: {text}");
+    assert!(text.contains("text/plain="), "listing should have text/plain count: {text}");
+
+    // X/listing/titleOrdered/v1 should be auto-generated
+    let listing = r
+        .get(zim::NAMESPACE_LISTING, "listing/titleOrdered/v1")
+        .expect("listing");
+    let text = String::from_utf8_lossy(&listing.data);
+    assert!(text.contains("Alpha\n"), "got: {text}");
+    assert!(text.contains("Beta\n"), "got: {text}");
+}
+
+#[test]
+fn illustration_round_trips() {
+    let mut w = Writer::new();
+    w.set_no_compress(true);
+    w.add_illustration(48, 48, 1, vec![1, 2, 3, 4]);
+
+    let mut data = Vec::new();
+    w.write_to(&mut data).expect("write");
+
+    let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("reader");
+    let blob = r
+        .get(NAMESPACE_METADATA, "Illustration_48x48@1")
+        .expect("illustration");
+    assert_eq!(blob.data, vec![1, 2, 3, 4]);
+    assert_eq!(blob.mime_type, "image/png");
 }

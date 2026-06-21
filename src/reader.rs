@@ -174,6 +174,137 @@ impl<R: Read + Seek> Reader<R> {
         Ok(Some((d.namespace, d.url)))
     }
 
+    /// Resolves an entry by title using the title pointer table.
+    ///
+    /// Returns the first entry whose title matches (case-sensitive).
+    /// If there are multiple entries with the same title in different
+    /// namespaces, `namespace` disambiguates; pass `namespace` from
+    /// a prior listing to pick a specific one, or use `0` for any.
+    pub fn get_by_title(&mut self, namespace: u8, title: &str) -> Result<Blob> {
+        let target = key(namespace, title);
+        let count = self.hdr.article_count;
+        let title_ptr_size = if count > 0 {
+            usize::try_from(
+                self.hdr.cluster_ptr_pos.saturating_sub(self.hdr.title_ptr_pos),
+            )
+            .map_err(|_| Error::SizeOverflow)?
+        } else {
+            0
+        };
+
+        let lo = self.lower_bound_title(&target, title_ptr_size)?;
+        if lo >= count {
+            return Err(Error::NotFound {
+                namespace,
+                url: title.to_owned(),
+            });
+        }
+
+        let d = self.dirent_at_title_index(lo)?;
+        let found = if namespace == 0 {
+            d.title == title
+        } else {
+            d.namespace == namespace && d.title == title
+        };
+
+        if found {
+            let url_idx = self.title_index_to_url_index(lo)?;
+            return self.blob_at_index(url_idx, 0);
+        }
+
+        Err(Error::NotFound {
+            namespace,
+            url: title.to_owned(),
+        })
+    }
+
+    /// Returns all entries whose title starts with `prefix` (case-sensitive).
+    pub fn entries_by_title_prefix(
+        &mut self,
+        namespace: u8,
+        prefix: &str,
+    ) -> Result<Vec<Entry>> {
+        let target = key(namespace, prefix);
+        let count = self.hdr.article_count;
+        if count == 0 || prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+        let title_ptr_size = usize::try_from(
+            self.hdr.cluster_ptr_pos.saturating_sub(self.hdr.title_ptr_pos),
+        )
+        .map_err(|_| Error::SizeOverflow)?;
+
+        let mut results = Vec::new();
+
+        // For namespace == 0 we must scan all entries (title index is sorted
+        // by namespace+title, not by title alone, so a binary prefix scan
+        // would miss entries in later namespace groups).
+        if namespace == 0 {
+            for idx in 0..count {
+                let d = self.dirent_at_title_index(idx)?;
+                if d.title.starts_with(prefix) {
+                    let url_idx = self.title_index_to_url_index(idx)?;
+                    results.push(self.entry_at(url_idx)?);
+                }
+            }
+            return Ok(results);
+        }
+
+        let mut idx = self.lower_bound_title(&target, title_ptr_size)?;
+        while idx < count {
+            let d = self.dirent_at_title_index(idx)?;
+            if d.namespace != namespace || !d.title.starts_with(prefix) {
+                if d.namespace > namespace {
+                    break;
+                }
+                if d.namespace == namespace && d.title.as_str() > prefix {
+                    break;
+                }
+                idx += 1;
+                continue;
+            }
+            let url_idx = self.title_index_to_url_index(idx)?;
+            results.push(self.entry_at(url_idx)?);
+            idx += 1;
+        }
+        Ok(results)
+    }
+
+    /// Returns the first title index where key >= target.
+    fn lower_bound_title(&mut self, target: &str, title_ptr_size: usize) -> Result<u32> {
+        let count = self.hdr.article_count;
+        let ptrs = self.at(self.hdr.title_ptr_pos, title_ptr_size)?;
+        let mut lo = 0u32;
+        let mut hi = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let url_idx = le_u32(&ptrs[4 * mid as usize..4 * (mid as usize + 1)]);
+            let d = self.dirent_at_index(url_idx)?;
+            match key(d.namespace, &d.title).as_str().cmp(target) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                _ => hi = mid,
+            }
+        }
+        Ok(lo)
+    }
+
+    fn dirent_at_title_index(&mut self, title_idx: u32) -> Result<Dirent> {
+        let title_ptr_size =
+            (self.hdr.cluster_ptr_pos - self.hdr.title_ptr_pos) as usize;
+        let ptrs = self.at(self.hdr.title_ptr_pos, title_ptr_size)?;
+        let url_idx = le_u32(&ptrs[4 * title_idx as usize..4 * (title_idx as usize + 1)]);
+        self.dirent_at_index(url_idx)
+    }
+
+    fn title_index_to_url_index(&mut self, title_idx: u32) -> Result<u32> {
+        let title_ptr_size =
+            (self.hdr.cluster_ptr_pos - self.hdr.title_ptr_pos) as usize;
+        let ptrs = self.at(self.hdr.title_ptr_pos, title_ptr_size)?;
+        Ok(le_u32(
+            &ptrs[4 * title_idx as usize..4 * (title_idx as usize + 1)],
+        ))
+    }
+
     /// Resolves the entry at `(namespace, url)`, following redirects.
     pub fn get(&mut self, namespace: u8, url: &str) -> Result<Blob> {
         let target = key(namespace, url);
