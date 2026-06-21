@@ -1,7 +1,7 @@
 use crate::codec::zstd_decode;
 use crate::format::{
-    le_u16, le_u32, le_u64, parse_header, COMP_NONE, COMP_XZ, COMP_ZSTD, EXTENDED_FLAG, HEADER_LEN,
-    NO_MAIN_PAGE, REDIRECT_ENTRY,
+    COMP_NONE, COMP_XZ, COMP_ZSTD, EXTENDED_FLAG, HEADER_LEN, NO_MAIN_PAGE, REDIRECT_ENTRY, le_u16,
+    le_u32, le_u64, parse_header,
 };
 use crate::{Error, Result};
 use memchr::memchr;
@@ -185,7 +185,9 @@ impl<R: Read + Seek> Reader<R> {
         let count = self.hdr.article_count;
         let title_ptr_size = if count > 0 {
             usize::try_from(
-                self.hdr.cluster_ptr_pos.saturating_sub(self.hdr.title_ptr_pos),
+                self.hdr
+                    .cluster_ptr_pos
+                    .saturating_sub(self.hdr.title_ptr_pos),
             )
             .map_err(|_| Error::SizeOverflow)?
         } else {
@@ -219,18 +221,16 @@ impl<R: Read + Seek> Reader<R> {
     }
 
     /// Returns all entries whose title starts with `prefix` (case-sensitive).
-    pub fn entries_by_title_prefix(
-        &mut self,
-        namespace: u8,
-        prefix: &str,
-    ) -> Result<Vec<Entry>> {
+    pub fn entries_by_title_prefix(&mut self, namespace: u8, prefix: &str) -> Result<Vec<Entry>> {
         let target = key(namespace, prefix);
         let count = self.hdr.article_count;
         if count == 0 || prefix.is_empty() {
             return Ok(Vec::new());
         }
         let title_ptr_size = usize::try_from(
-            self.hdr.cluster_ptr_pos.saturating_sub(self.hdr.title_ptr_pos),
+            self.hdr
+                .cluster_ptr_pos
+                .saturating_sub(self.hdr.title_ptr_pos),
         )
         .map_err(|_| Error::SizeOverflow)?;
 
@@ -289,16 +289,14 @@ impl<R: Read + Seek> Reader<R> {
     }
 
     fn dirent_at_title_index(&mut self, title_idx: u32) -> Result<Dirent> {
-        let title_ptr_size =
-            (self.hdr.cluster_ptr_pos - self.hdr.title_ptr_pos) as usize;
+        let title_ptr_size = (self.hdr.cluster_ptr_pos - self.hdr.title_ptr_pos) as usize;
         let ptrs = self.at(self.hdr.title_ptr_pos, title_ptr_size)?;
         let url_idx = le_u32(&ptrs[4 * title_idx as usize..4 * (title_idx as usize + 1)]);
         self.dirent_at_index(url_idx)
     }
 
     fn title_index_to_url_index(&mut self, title_idx: u32) -> Result<u32> {
-        let title_ptr_size =
-            (self.hdr.cluster_ptr_pos - self.hdr.title_ptr_pos) as usize;
+        let title_ptr_size = (self.hdr.cluster_ptr_pos - self.hdr.title_ptr_pos) as usize;
         let ptrs = self.at(self.hdr.title_ptr_pos, title_ptr_size)?;
         Ok(le_u32(
             &ptrs[4 * title_idx as usize..4 * (title_idx as usize + 1)],

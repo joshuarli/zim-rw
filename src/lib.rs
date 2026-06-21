@@ -4,7 +4,9 @@ mod reader;
 mod writer;
 
 pub use codec::compress;
-pub use format::{MAGIC, NAMESPACE_CONTENT, NAMESPACE_LISTING, NAMESPACE_METADATA, NAMESPACE_WELL_KNOWN};
+pub use format::{
+    MAGIC, NAMESPACE_CONTENT, NAMESPACE_LISTING, NAMESPACE_METADATA, NAMESPACE_WELL_KNOWN,
+};
 pub use reader::{Blob, Entry, Reader};
 pub use writer::Writer;
 

@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 #[test]
@@ -57,6 +58,94 @@ fn build_then_serve_round_trips_uncompressed_data() {
 
     server.kill().expect("kill server");
     server.wait().expect("wait server");
+}
+
+#[test]
+fn build_extract_round_trip() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("site");
+    fs::create_dir_all(root.join("assets/sub")).expect("create dirs");
+
+    let files: Vec<(&str, &[u8])> = vec![
+        ("index.html", b"<html><body>Hello from ZIM</body></html>\n"),
+        ("style.css", b"h1 { color: red; }\n"),
+        ("assets/logo.png", &[0x89, b'P', b'N', b'G', 0, 1, 2, 3]),
+        ("assets/sub/app.js", b"console.log(1);\n"),
+        ("readme.txt", b"plain text\n"),
+    ];
+    for (rel, data) in &files {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent");
+        }
+        fs::write(&path, data).expect("write file");
+    }
+
+    let bin = env!("CARGO_BIN_EXE_zim");
+    let zim_path = root.with_file_name("site.zim");
+
+    let build = Command::new(bin)
+        .arg("build")
+        .arg(&root)
+        .arg("-o")
+        .arg(&zim_path)
+        .output()
+        .expect("run build");
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let extracted = temp.path().join("out");
+    let ext = Command::new(bin)
+        .arg("extract")
+        .arg(&zim_path)
+        .arg("-o")
+        .arg(&extracted)
+        .output()
+        .expect("run extract");
+    assert!(
+        ext.status.success(),
+        "extract failed: {}",
+        String::from_utf8_lossy(&ext.stderr)
+    );
+
+    for (rel, expected) in &files {
+        let path = extracted.join(rel);
+        let actual = fs::read(&path).unwrap_or_else(|_| panic!("missing extracted file: {rel}"));
+        assert_eq!(actual, *expected, "mismatch in {rel}");
+    }
+
+    // Verify no extra files were extracted
+    let mut extracted_files = Vec::new();
+    collect_files(&extracted, &extracted, &mut extracted_files).expect("collect");
+    assert_eq!(
+        extracted_files.len(),
+        files.len(),
+        "unexpected file count in extracted dir"
+    );
+}
+
+fn collect_files(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, std::path::PathBuf)>,
+) -> std::io::Result<()> {
+    for entry in walkdir::WalkDir::new(dir) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            let path = entry.into_path();
+            let rel = path.strip_prefix(root).expect("entry is under root");
+            let url = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            out.push((url, path));
+        }
+    }
+    Ok(())
 }
 
 fn http_get(addr: &str, path: &str) -> Vec<u8> {

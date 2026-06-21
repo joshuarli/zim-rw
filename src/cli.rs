@@ -5,7 +5,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
-use zim::{Reader, Writer, NAMESPACE_CONTENT, NAMESPACE_WELL_KNOWN};
+use zim::{NAMESPACE_CONTENT, NAMESPACE_WELL_KNOWN, Reader, Writer};
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -25,10 +25,18 @@ fn run() -> CliResult<()> {
             println!("{}", output.display());
             Ok(())
         }
+        Some("extract") => {
+            let (zim_path, out, quiet) = parse_extract_args(&args[1..])?;
+            extract_archive(Path::new(&zim_path), out.as_deref(), quiet)?;
+            Ok(())
+        }
         Some("serve") if args.len() == 2 => serve_archive(Path::new(&args[1])),
         _ => {
             eprintln!("usage:");
-            eprintln!("  zim build <rootdir> [-o|--out <file.zim>] [-q|--quiet] [-l|--level <1-22>]");
+            eprintln!(
+                "  zim build <rootdir> [-o|--out <file.zim>] [-q|--quiet] [-l|--level <1-22>]"
+            );
+            eprintln!("  zim extract <file.zim> [-o|--out <dir>] [-q|--quiet]");
             eprintln!("  zim serve <file.zim>");
             std::process::exit(2);
         }
@@ -80,7 +88,12 @@ fn parse_build_args(args: &[String]) -> CliResult<(String, Option<PathBuf>, bool
     }
 }
 
-fn build_archive(root: &Path, out: Option<&Path>, quiet: bool, level: Option<i32>) -> CliResult<PathBuf> {
+fn build_archive(
+    root: &Path,
+    out: Option<&Path>,
+    quiet: bool,
+    level: Option<i32>,
+) -> CliResult<PathBuf> {
     if !root.is_dir() {
         return Err(format!("{} is not a directory", root.display()).into());
     }
@@ -231,6 +244,87 @@ fn mime_for_path(path: &Path) -> &'static str {
     }
 }
 
+fn parse_extract_args(args: &[String]) -> CliResult<(String, Option<PathBuf>, bool)> {
+    let mut zim: Option<String> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut quiet = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--out" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value for -o/--out".into());
+                }
+                out = Some(PathBuf::from(&args[i]));
+            }
+            "-q" | "--quiet" => quiet = true,
+            arg if arg.starts_with('-') => {
+                return Err(format!("unknown flag: {arg}").into());
+            }
+            arg => {
+                if zim.is_some() {
+                    return Err(format!("unexpected argument: {arg}").into());
+                }
+                zim = Some(arg.to_owned());
+            }
+        }
+        i += 1;
+    }
+    match zim {
+        Some(zim) => Ok((zim, out, quiet)),
+        None => Err("missing <file.zim> argument".into()),
+    }
+}
+
+fn extract_archive(zim_path: &Path, out: Option<&Path>, quiet: bool) -> CliResult<()> {
+    if !zim_path.is_file() {
+        return Err(format!("{} is not a file", zim_path.display()).into());
+    }
+
+    let out_dir = match out {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let stem = zim_path
+                .file_stem()
+                .ok_or("zim file must have a file name")?
+                .to_string_lossy();
+            zim_path.with_file_name(stem.as_ref())
+        }
+    };
+    fs::create_dir_all(&out_dir)?;
+
+    let mut reader = Reader::open(zim_path)?;
+    let count = reader.count();
+    let mut extracted = 0usize;
+    let show_progress = !quiet && io::stderr().is_terminal();
+
+    for idx in 0..count {
+        let entry = reader.entry_at(idx)?;
+        if entry.redirect || entry.namespace != NAMESPACE_CONTENT {
+            continue;
+        }
+        let file_path = out_dir.join(&entry.url);
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&file_path, &entry.data)?;
+        extracted += 1;
+        if show_progress {
+            progress(extracted, extracted, &entry.url);
+        }
+    }
+
+    if show_progress {
+        eprint!("\r\x1b[K");
+        let _ = io::stderr().flush();
+    }
+    if !quiet {
+        eprintln!("extracted {} files to {}", extracted, out_dir.display());
+    }
+    Ok(())
+}
+
 fn serve_archive(path: &Path) -> CliResult<()> {
     let addr = env::var("ZIM_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
     let listener = TcpListener::bind(&addr)?;
@@ -327,13 +421,12 @@ fn percent_decode(input: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(a), Some(b)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+        if bytes[i] == b'%' && i + 2 < bytes.len()
+            && let (Some(a), Some(b)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
                 out.push(a << 4 | b);
                 i += 3;
                 continue;
             }
-        }
         out.push(bytes[i]);
         i += 1;
     }

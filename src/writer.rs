@@ -1,7 +1,7 @@
 use crate::codec::{is_text_mime, zstd_encode};
 use crate::format::{
-    md5, put_u16, put_u32, put_u64, Header, COMP_NONE, COMP_ZSTD, HEADER_LEN, NAMESPACE_LISTING,
-    NAMESPACE_METADATA, NO_MAIN_PAGE, REDIRECT_ENTRY,
+    COMP_NONE, COMP_ZSTD, HEADER_LEN, Header, NAMESPACE_LISTING, NAMESPACE_METADATA, NO_MAIN_PAGE,
+    REDIRECT_ENTRY, md5, put_u16, put_u32, put_u64,
 };
 use crate::reader::make_key as key;
 use crate::{Error, Result};
@@ -297,7 +297,7 @@ impl Writer {
         let mut wrote = 0u64;
 
         let hdr = p.hdr.marshal();
-        ctx.consume(&hdr);
+        ctx.consume(hdr);
         out.write_all(&hdr)?;
         wrote += hdr.len() as u64;
 
@@ -353,8 +353,7 @@ impl Writer {
 
         let (plan, cluster_entries) = self.build_plan_metadata()?;
         if cluster_entries.is_empty() {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Error::Io(std::io::Error::other(
                 "archive has no content entries",
             )));
         }
@@ -435,9 +434,11 @@ impl Writer {
                 .map(|&bi| {
                     let e = &plan.entries[ce.entry_indices[bi]];
                     if e.data.is_empty() && e.data_len > 0 {
-                        return Err(Error::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("entry '{}' has no stored data; use write_to_streaming", e.url),
+                        return Err(Error::Io(std::io::Error::other(
+                            format!(
+                                "entry '{}' has no stored data; use write_to_streaming",
+                                e.url
+                            ),
                         )));
                     }
                     Ok(e.data.clone())
@@ -510,7 +511,10 @@ impl Writer {
         }
 
         // Auto-generate M/Counter (after listing so it's included in counts)
-        if !self.by_key.contains_key(&key(NAMESPACE_METADATA, "Counter")) {
+        if !self
+            .by_key
+            .contains_key(&key(NAMESPACE_METADATA, "Counter"))
+        {
             let mut counts: FxHashMap<&str, u32> = FxHashMap::default();
             for e in &self.entries {
                 if !e.redirect && !e.mime.is_empty() {
@@ -530,7 +534,7 @@ impl Writer {
         let mut plan = PlanMetadata::default();
         let mut ents = self.entries.clone();
         ents.sort_by_key(|a| key(a.namespace, &a.url));
-        let mut index = FxHashMap::with_capacity_and_hasher(ents.len(), FxBuildHasher::default());
+        let mut index = FxHashMap::with_capacity_and_hasher(ents.len(), FxBuildHasher);
         for (i, e) in ents.iter_mut().enumerate() {
             e.url_index = i as u32;
             index.insert(key(e.namespace, &e.url), i as u32);
@@ -612,11 +616,10 @@ impl Writer {
             layout_page: NO_MAIN_PAGE,
             checksum_pos: 0, // filled later
         };
-        if !self.main_key.is_empty() {
-            if let Some(mi) = index.get(&self.main_key) {
+        if !self.main_key.is_empty()
+            && let Some(mi) = index.get(&self.main_key) {
                 plan.hdr.main_page = *mi;
             }
-        }
         plan.cluster_ptr_pos = cluster_ptr_pos;
         plan.entries = ents;
 
@@ -670,7 +673,11 @@ fn pack_clusters(ents: &[WriterEntry], writer: &Writer) -> Vec<ClusterEntry> {
         let blob_idx = ce.blob_indices.len();
         ce.blob_indices.push(blob_idx);
         ce.entry_indices.push(ei);
-        let current: usize = ce.blob_indices.iter().map(|&i| writer.entry_size(&ents[ce.entry_indices[i]])).sum();
+        let current: usize = ce
+            .blob_indices
+            .iter()
+            .map(|&i| writer.entry_size(&ents[ce.entry_indices[i]]))
+            .sum();
         if current >= MAX_CLUSTER_CONTENT {
             *cur = None;
         }
@@ -739,7 +746,7 @@ fn write_clusters(
     let mut current = metadata_end;
     let mut handles: VecDeque<std::thread::JoinHandle<Result<Vec<u8>>>> = VecDeque::new();
 
-    for (_ci, ce) in cluster_entries.iter().enumerate() {
+    for ce in cluster_entries.iter() {
         // Build raw cluster data: offset table + concatenated blobs
         let raw = build_raw_cluster(ce, entries, data_provider)?;
         let comp = if no_compress { COMP_NONE } else { ce.comp };
@@ -748,14 +755,11 @@ fn write_clusters(
         handles.push_back(handle);
 
         if handles.len() >= num_threads {
-            let encoded = handles
-                .pop_front()
-                .unwrap()
-                .join()
-                .map_err(|_| Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+            let encoded = handles.pop_front().unwrap().join().map_err(|_| {
+                Error::Io(std::io::Error::other(
                     "compression thread panicked",
-                )))??;
+                ))
+            })??;
             let start = current;
             out.write_all(&encoded)?;
             current += encoded.len() as u64;
@@ -764,12 +768,11 @@ fn write_clusters(
     }
 
     for handle in handles {
-        let encoded = handle
-            .join()
-            .map_err(|_| Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+        let encoded = handle.join().map_err(|_| {
+            Error::Io(std::io::Error::other(
                 "compression thread panicked",
-            )))??;
+            ))
+        })??;
         let start = current;
         out.write_all(&encoded)?;
         current += encoded.len() as u64;

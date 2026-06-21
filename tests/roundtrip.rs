@@ -1,5 +1,5 @@
 use std::io::Cursor;
-use zim::{Reader, Writer, NAMESPACE_CONTENT, NAMESPACE_METADATA, NAMESPACE_WELL_KNOWN};
+use zim::{NAMESPACE_CONTENT, NAMESPACE_METADATA, NAMESPACE_WELL_KNOWN, Reader, Writer};
 
 fn build_sample(no_compress: bool) -> Vec<u8> {
     let mut w = Writer::new();
@@ -52,9 +52,7 @@ fn round_trip() {
         assert!(String::from_utf8_lossy(&home.data).starts_with("<h1>Home</h1>"));
         assert_eq!(home.mime_type, "text/html");
 
-        let logo = r
-            .get(NAMESPACE_CONTENT, "_k/h/logo.png")
-            .expect("get logo");
+        let logo = r.get(NAMESPACE_CONTENT, "_k/h/logo.png").expect("get logo");
         assert_eq!(logo.data, vec![0x89, b'P', b'N', b'G', 0, 1, 2, 3, 4, 5]);
         assert_eq!(logo.mime_type, "image/png");
 
@@ -276,9 +274,7 @@ fn reads_extended_cluster_offsets() {
     if cluster_count > 1 {
         for ci in 1..cluster_count as usize {
             let ptr_off = cluster_ptr_pos + 8 * ci;
-            let old_pos = u64::from_le_bytes(
-                data[ptr_off..ptr_off + 8].try_into().unwrap(),
-            );
+            let old_pos = u64::from_le_bytes(data[ptr_off..ptr_off + 8].try_into().unwrap());
             let new_pos = (old_pos as i64 + diff) as u64;
             data[ptr_off..ptr_off + 8].copy_from_slice(&new_pos.to_le_bytes());
         }
@@ -329,9 +325,27 @@ fn reads_old_zero_compression_as_uncompressed() {
 fn title_lookup_works() {
     let mut w = Writer::new();
     w.set_no_compress(true);
-    w.add_content(NAMESPACE_CONTENT, "index.html", "Home Page", "text/html", b"<h1>Home</h1>".to_vec());
-    w.add_content(NAMESPACE_CONTENT, "about.html", "About Us", "text/html", b"<h1>About</h1>".to_vec());
-    w.add_content(NAMESPACE_CONTENT, "contact.html", "Contact", "text/html", b"<h1>Contact</h1>".to_vec());
+    w.add_content(
+        NAMESPACE_CONTENT,
+        "index.html",
+        "Home Page",
+        "text/html",
+        b"<h1>Home</h1>".to_vec(),
+    );
+    w.add_content(
+        NAMESPACE_CONTENT,
+        "about.html",
+        "About Us",
+        "text/html",
+        b"<h1>About</h1>".to_vec(),
+    );
+    w.add_content(
+        NAMESPACE_CONTENT,
+        "contact.html",
+        "Contact",
+        "text/html",
+        b"<h1>Contact</h1>".to_vec(),
+    );
 
     let mut data = Vec::new();
     w.write_to(&mut data).expect("write");
@@ -342,7 +356,9 @@ fn title_lookup_works() {
     assert_eq!(blob.url, "about.html");
     assert_eq!(blob.data, b"<h1>About</h1>");
 
-    let blob = r.get_by_title(NAMESPACE_CONTENT, "Home Page").expect("namespace filtered");
+    let blob = r
+        .get_by_title(NAMESPACE_CONTENT, "Home Page")
+        .expect("namespace filtered");
     assert_eq!(blob.url, "index.html");
 
     let results = r.entries_by_title_prefix(0, "About").expect("prefix");
@@ -359,8 +375,20 @@ fn title_lookup_works() {
 fn counter_and_listing_are_generated() {
     let mut w = Writer::new();
     w.set_no_compress(true);
-    w.add_content(NAMESPACE_CONTENT, "a.html", "Alpha", "text/html", b"a".to_vec());
-    w.add_content(NAMESPACE_CONTENT, "b.png", "Beta", "image/png", b"b".to_vec());
+    w.add_content(
+        NAMESPACE_CONTENT,
+        "a.html",
+        "Alpha",
+        "text/html",
+        b"a".to_vec(),
+    );
+    w.add_content(
+        NAMESPACE_CONTENT,
+        "b.png",
+        "Beta",
+        "image/png",
+        b"b".to_vec(),
+    );
 
     let mut data = Vec::new();
     w.write_to(&mut data).expect("write");
@@ -372,7 +400,10 @@ fn counter_and_listing_are_generated() {
     let text = String::from_utf8_lossy(&counter.data);
     assert!(text.contains("image/png=1"), "got: {text}");
     assert!(text.contains("text/html=1"), "got: {text}");
-    assert!(text.contains("text/plain="), "listing should have text/plain count: {text}");
+    assert!(
+        text.contains("text/plain="),
+        "listing should have text/plain count: {text}"
+    );
 
     // X/listing/titleOrdered/v1 should be auto-generated
     let listing = r
