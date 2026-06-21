@@ -5,7 +5,7 @@ use crate::format::{
 };
 use crate::{Error, Result};
 use memchr::memchr;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -43,7 +43,7 @@ pub struct Reader<R> {
     size: u64,
     hdr: crate::format::Header,
     mimes: Vec<String>,
-    cache: HashMap<u32, CacheEntry>,
+    cache: FxHashMap<u32, CacheEntry>,
 }
 
 struct CacheEntry {
@@ -80,7 +80,7 @@ impl<R: Read + Seek> Reader<R> {
             size,
             hdr: crate::format::Header::default(),
             mimes: Vec::new(),
-            cache: HashMap::new(),
+            cache: FxHashMap::default(),
         };
         let hb = r.at(0, HEADER_LEN)?;
         r.hdr = parse_header(&hb)?;

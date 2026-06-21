@@ -5,7 +5,7 @@ use crate::format::{
 };
 use crate::reader::make_key as key;
 use crate::{Error, Result};
-use std::collections::HashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 const MAX_CLUSTER_CONTENT: usize = 2 << 20;
@@ -15,9 +15,10 @@ type Compressor = dyn Fn(&[u8]) -> Result<Vec<u8>> + Send + Sync;
 /// Accumulates entries and serializes them as a ZIM file.
 pub struct Writer {
     entries: Vec<WriterEntry>,
-    by_key: HashMap<String, usize>,
+    by_key: FxHashMap<String, usize>,
     main_key: String,
     no_compress: bool,
+    compression_level: i32,
     compress: Box<Compressor>,
 }
 
@@ -66,16 +67,27 @@ impl Writer {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            by_key: HashMap::new(),
+            by_key: FxHashMap::default(),
             main_key: String::new(),
             no_compress: false,
-            compress: Box::new(zstd_encode),
+            compression_level: 3,
+            compress: Box::new(|data| zstd_encode(data, 3)),
         }
     }
 
     /// Stores every cluster uncompressed.
     pub fn set_no_compress(&mut self, v: bool) {
         self.no_compress = v;
+    }
+
+    /// Sets the zstd compression level (1–22, default 3).
+    ///
+    /// Lower values favour speed; higher values favour size. Level 3 gives
+    /// fast decompression for serving while still compressing well.
+    pub fn set_compression_level(&mut self, level: i32) {
+        self.compression_level = level;
+        let l = level; // copy for closure
+        self.compress = Box::new(move |data| zstd_encode(data, l));
     }
 
     /// Replaces the cluster compressor.
@@ -89,9 +101,10 @@ impl Writer {
         self.compress = Box::new(f);
     }
 
-    /// Restores the built-in zstd compressor.
+    /// Restores the built-in zstd compressor at the current compression level.
     pub fn reset_compress(&mut self) {
-        self.compress = Box::new(zstd_encode);
+        let l = self.compression_level;
+        self.compress = Box::new(move |data| zstd_encode(data, l));
     }
 
     /// Adds or replaces a content entry.
@@ -344,6 +357,7 @@ impl Writer {
             &plan.entries,
             &mut data_provider,
             self.no_compress,
+            self.compression_level,
             num_threads,
         )?;
 
@@ -450,7 +464,7 @@ impl Writer {
         let mut plan = PlanMetadata::default();
         let mut ents = self.entries.clone();
         ents.sort_by_key(|a| key(a.namespace, &a.url));
-        let mut index = HashMap::with_capacity(ents.len());
+        let mut index = FxHashMap::with_capacity_and_hasher(ents.len(), FxBuildHasher::default());
         for (i, e) in ents.iter_mut().enumerate() {
             e.url_index = i as u32;
             index.insert(key(e.namespace, &e.url), i as u32);
@@ -470,7 +484,7 @@ impl Writer {
         }
 
         let mut mimes = Vec::new();
-        let mut mime_index = HashMap::new();
+        let mut mime_index = FxHashMap::default();
         for e in &mut ents {
             if e.redirect {
                 continue;
@@ -649,6 +663,7 @@ fn write_clusters(
     entries: &[WriterEntry],
     data_provider: &mut impl FnMut(usize) -> Result<Vec<u8>>,
     no_compress: bool,
+    level: i32,
     num_threads: usize,
 ) -> Result<Vec<(u64, u64)>> {
     use std::collections::VecDeque;
@@ -663,7 +678,7 @@ fn write_clusters(
         let raw = build_raw_cluster(ce, entries, data_provider)?;
         let comp = if no_compress { COMP_NONE } else { ce.comp };
 
-        let handle = std::thread::spawn(move || encode_cluster_data(comp, raw));
+        let handle = std::thread::spawn(move || encode_cluster_data(comp, raw, level));
         handles.push_back(handle);
 
         if handles.len() >= num_threads {
@@ -741,9 +756,9 @@ fn build_raw_cluster(
     Ok(data)
 }
 
-fn encode_cluster_data(comp: u8, raw: Vec<u8>) -> Result<Vec<u8>> {
+fn encode_cluster_data(comp: u8, raw: Vec<u8>, level: i32) -> Result<Vec<u8>> {
     let payload = if comp == COMP_ZSTD {
-        zstd_encode(&raw)?
+        zstd_encode(&raw, level)?
     } else {
         raw
     };

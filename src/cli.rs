@@ -20,25 +20,26 @@ fn run() -> CliResult<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("build") => {
-            let (root, out, quiet) = parse_build_args(&args[1..])?;
-            let output = build_archive(Path::new(&root), out.as_deref(), quiet)?;
+            let (root, out, quiet, level) = parse_build_args(&args[1..])?;
+            let output = build_archive(Path::new(&root), out.as_deref(), quiet, level)?;
             println!("{}", output.display());
             Ok(())
         }
         Some("serve") if args.len() == 2 => serve_archive(Path::new(&args[1])),
         _ => {
             eprintln!("usage:");
-            eprintln!("  zim build <rootdir> [-o|--out <file.zim>] [-q|--quiet]");
+            eprintln!("  zim build <rootdir> [-o|--out <file.zim>] [-q|--quiet] [-l|--level <1-22>]");
             eprintln!("  zim serve <file.zim>");
             std::process::exit(2);
         }
     }
 }
 
-fn parse_build_args(args: &[String]) -> CliResult<(String, Option<PathBuf>, bool)> {
+fn parse_build_args(args: &[String]) -> CliResult<(String, Option<PathBuf>, bool, Option<i32>)> {
     let mut root: Option<String> = None;
     let mut out: Option<PathBuf> = None;
     let mut quiet = false;
+    let mut level: Option<i32> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -48,6 +49,17 @@ fn parse_build_args(args: &[String]) -> CliResult<(String, Option<PathBuf>, bool
                     return Err("missing value for -o/--out".into());
                 }
                 out = Some(PathBuf::from(&args[i]));
+            }
+            "-l" | "--level" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value for -l/--level".into());
+                }
+                level = Some(
+                    args[i]
+                        .parse()
+                        .map_err(|_| format!("invalid compression level: {}", args[i]))?,
+                );
             }
             "-q" | "--quiet" => quiet = true,
             arg if arg.starts_with('-') => {
@@ -63,12 +75,12 @@ fn parse_build_args(args: &[String]) -> CliResult<(String, Option<PathBuf>, bool
         i += 1;
     }
     match root {
-        Some(root) => Ok((root, out, quiet)),
+        Some(root) => Ok((root, out, quiet, level)),
         None => Err("missing <rootdir> argument".into()),
     }
 }
 
-fn build_archive(root: &Path, out: Option<&Path>, quiet: bool) -> CliResult<PathBuf> {
+fn build_archive(root: &Path, out: Option<&Path>, quiet: bool, level: Option<i32>) -> CliResult<PathBuf> {
     if !root.is_dir() {
         return Err(format!("{} is not a directory", root.display()).into());
     }
@@ -81,6 +93,9 @@ fn build_archive(root: &Path, out: Option<&Path>, quiet: bool) -> CliResult<Path
     }
 
     let mut writer = Writer::new();
+    if let Some(l) = level {
+        writer.set_compression_level(l);
+    }
     for (url, path) in &files {
         let size = fs::metadata(path)?.len();
         writer.add_entry(NAMESPACE_CONTENT, url, "", mime_for_path(path), size);

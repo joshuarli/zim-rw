@@ -1,12 +1,12 @@
 use crate::{Error, Result};
 
-pub(crate) fn zstd_encode(p: &[u8]) -> Result<Vec<u8>> {
-    zstd::bulk::compress(p, 9).map_err(|err| Error::Compression(err.to_string()))
+pub(crate) fn zstd_encode(p: &[u8], level: i32) -> Result<Vec<u8>> {
+    zstd::bulk::compress(p, level).map_err(|err| Error::Compression(err.to_string()))
 }
 
-/// Compresses bytes with the same zstd level the writer uses for text clusters.
+/// Compresses bytes with zstd level 3 (fast, decent ratio).
 pub fn compress(p: &[u8]) -> Result<Vec<u8>> {
-    zstd_encode(p)
+    zstd_encode(p, 3)
 }
 
 pub(crate) fn zstd_decode(p: &[u8]) -> Result<Vec<u8>> {
