@@ -756,7 +756,8 @@ fn encode_cluster_data(comp: u8, raw: Vec<u8>) -> Result<Vec<u8>> {
 fn stream_md5(out: &mut (impl Read + Write + Seek), checksum_pos: u64) -> Result<[u8; 16]> {
     let mut ctx = md5::Context::new();
     let mut remaining = checksum_pos;
-    let mut buf = vec![0u8; 64 * 1024];
+    // 8 MiB buffer keeps syscall count low for large archives
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
     while remaining > 0 {
         let n = remaining.min(buf.len() as u64) as usize;
         let chunk = &mut buf[..n];

@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 
@@ -20,24 +20,25 @@ fn run() -> CliResult<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("build") => {
-            let (root, out) = parse_build_args(&args[1..])?;
-            let output = build_archive(Path::new(&root), out.as_deref())?;
+            let (root, out, quiet) = parse_build_args(&args[1..])?;
+            let output = build_archive(Path::new(&root), out.as_deref(), quiet)?;
             println!("{}", output.display());
             Ok(())
         }
         Some("serve") if args.len() == 2 => serve_archive(Path::new(&args[1])),
         _ => {
             eprintln!("usage:");
-            eprintln!("  zim build <rootdir> [-o|--out <file.zim>]");
+            eprintln!("  zim build <rootdir> [-o|--out <file.zim>] [-q|--quiet]");
             eprintln!("  zim serve <file.zim>");
             std::process::exit(2);
         }
     }
 }
 
-fn parse_build_args(args: &[String]) -> CliResult<(String, Option<PathBuf>)> {
+fn parse_build_args(args: &[String]) -> CliResult<(String, Option<PathBuf>, bool)> {
     let mut root: Option<String> = None;
     let mut out: Option<PathBuf> = None;
+    let mut quiet = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -48,6 +49,7 @@ fn parse_build_args(args: &[String]) -> CliResult<(String, Option<PathBuf>)> {
                 }
                 out = Some(PathBuf::from(&args[i]));
             }
+            "-q" | "--quiet" => quiet = true,
             arg if arg.starts_with('-') => {
                 return Err(format!("unknown flag: {arg}").into());
             }
@@ -61,12 +63,12 @@ fn parse_build_args(args: &[String]) -> CliResult<(String, Option<PathBuf>)> {
         i += 1;
     }
     match root {
-        Some(root) => Ok((root, out)),
+        Some(root) => Ok((root, out, quiet)),
         None => Err("missing <rootdir> argument".into()),
     }
 }
 
-fn build_archive(root: &Path, out: Option<&Path>) -> CliResult<PathBuf> {
+fn build_archive(root: &Path, out: Option<&Path>, quiet: bool) -> CliResult<PathBuf> {
     if !root.is_dir() {
         return Err(format!("{} is not a directory", root.display()).into());
     }
@@ -108,6 +110,8 @@ fn build_archive(root: &Path, out: Option<&Path>) -> CliResult<PathBuf> {
     let path_refs: Vec<&PathBuf> = files.iter().map(|(_, p)| p).collect();
     let total = files.len();
     let mut packed = 0usize;
+    let show_progress = !quiet && io::stderr().is_terminal();
+
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -119,14 +123,22 @@ fn build_archive(root: &Path, out: Option<&Path>) -> CliResult<PathBuf> {
         |idx| {
             let data = fs::read(path_refs[idx])?;
             packed += 1;
-            progress(packed, total, &files[idx].0);
+            if show_progress {
+                progress(packed, total, &files[idx].0);
+            }
             Ok(data)
         },
         0,
     )?;
-    eprint!("\r\x1b[K");
-    let _ = io::stderr().flush();
-    eprintln!("wrote {} files to {}", files.len(), output.display());
+    file.flush()?;
+
+    if show_progress {
+        eprint!("\r\x1b[K");
+        let _ = io::stderr().flush();
+    }
+    if !quiet {
+        eprintln!("wrote {} files to {}", files.len(), output.display());
+    }
     Ok(output)
 }
 
@@ -136,10 +148,17 @@ fn progress(n: usize, total: usize, label: &str) {
     let mut bar = String::with_capacity(w + 2);
     bar.push('[');
     for i in 0..w {
-        bar.push(if i < filled { '=' } else if i == filled { '>' } else { ' ' });
+        bar.push(if i < filled {
+            '='
+        } else if i == filled {
+            '>'
+        } else {
+            ' '
+        });
     }
     bar.push(']');
-    eprint!("\r\x1b[K  {bar} {n}/{total} {label}");
+    // Trailing spaces ensure we clear any leftover chars from a longer previous line
+    eprint!("\r  {bar} {n}/{total} {label}                \r");
     let _ = io::stderr().flush();
 }
 
