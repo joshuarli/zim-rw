@@ -6,7 +6,7 @@ use crate::format::{
 use crate::reader::make_key as key;
 use crate::{Error, Result};
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 
 const MAX_CLUSTER_CONTENT: usize = 2 << 20;
 
@@ -28,6 +28,7 @@ struct WriterEntry {
     title: String,
     mime: String,
     data: Vec<u8>,
+    data_len: u64,
     redirect: bool,
     target_key: String,
     mime_idx: u16,
@@ -52,7 +53,6 @@ struct Plan {
 struct ClusterBuf {
     comp: u8,
     blobs: Vec<Vec<u8>>,
-    size: usize,
 }
 
 impl Default for Writer {
@@ -118,6 +118,47 @@ impl Writer {
             title,
             mime,
             data: data.into(),
+            data_len: 0,
+            redirect: false,
+            target_key: String::new(),
+            mime_idx: 0,
+            cluster: 0,
+            blob: 0,
+            target_index: 0,
+            url_index: 0,
+            position: 0,
+        });
+    }
+
+    /// Declares an entry without storing its data.
+    ///
+    /// The data will be provided later via [`write_to_streaming`] or
+    /// [`write_to_file`]. `data_len` is the uncompressed byte count and
+    /// must match the actual data length.
+    pub fn add_entry(
+        &mut self,
+        namespace: u8,
+        url: impl Into<String>,
+        title: impl Into<String>,
+        mime: impl Into<String>,
+        data_len: u64,
+    ) {
+        let url = url.into();
+        let mut title = title.into();
+        if title.is_empty() {
+            title = url.clone();
+        }
+        let mut mime = mime.into();
+        if mime.is_empty() {
+            mime = "application/octet-stream".to_owned();
+        }
+        self.put(WriterEntry {
+            namespace,
+            url,
+            title,
+            mime,
+            data: Vec::new(),
+            data_len,
             redirect: false,
             target_key: String::new(),
             mime_idx: 0,
@@ -138,6 +179,7 @@ impl Writer {
             title: name,
             mime: "text/plain".to_owned(),
             data: value.into().into_bytes(),
+            data_len: 0,
             redirect: false,
             target_key: String::new(),
             mime_idx: 0,
@@ -167,6 +209,7 @@ impl Writer {
             title: name,
             mime,
             data: data.into(),
+            data_len: 0,
             redirect: false,
             target_key: String::new(),
             mime_idx: 0,
@@ -199,6 +242,7 @@ impl Writer {
             title,
             mime: String::new(),
             data: Vec::new(),
+            data_len: 0,
             redirect: true,
             target_key: key(target_namespace, &target_url),
             mime_idx: 0,
@@ -216,21 +260,120 @@ impl Writer {
     }
 
     /// Serializes the archive to `out` and returns the number of bytes written.
+    ///
+    /// If `out` supports [`Seek`], use [`write_to_file`](Self::write_to_file)
+    /// instead for lower memory usage.
     pub fn write_to(&mut self, out: &mut impl Write) -> Result<u64> {
         let p = self.build_plan()?;
-        let mut body = Vec::new();
-        body.extend_from_slice(&p.hdr.marshal());
-        body.extend_from_slice(&p.mime_list);
-        body.extend_from_slice(&p.url_ptrs);
-        body.extend_from_slice(&p.title_ptrs);
-        body.extend_from_slice(&p.cluster_ptrs);
+        let mut ctx = md5::Context::new();
+        let mut wrote = 0u64;
+
+        let hdr = p.hdr.marshal();
+        ctx.consume(&hdr);
+        out.write_all(&hdr)?;
+        wrote += hdr.len() as u64;
+
+        ctx.consume(&p.mime_list);
+        out.write_all(&p.mime_list)?;
+        wrote += p.mime_list.len() as u64;
+
+        ctx.consume(&p.url_ptrs);
+        out.write_all(&p.url_ptrs)?;
+        wrote += p.url_ptrs.len() as u64;
+
+        ctx.consume(&p.title_ptrs);
+        out.write_all(&p.title_ptrs)?;
+        wrote += p.title_ptrs.len() as u64;
+
+        ctx.consume(&p.cluster_ptrs);
+        out.write_all(&p.cluster_ptrs)?;
+        wrote += p.cluster_ptrs.len() as u64;
+
         for section in p.dirents.iter().chain(p.clusters.iter()) {
-            body.extend_from_slice(section);
+            ctx.consume(section);
+            out.write_all(section)?;
+            wrote += section.len() as u64;
         }
-        let digest = md5(&body);
-        out.write_all(&body)?;
+
+        let digest = ctx.finalize().0;
         out.write_all(&digest)?;
-        Ok((body.len() + digest.len()) as u64)
+        wrote += 16;
+        Ok(wrote)
+    }
+
+    /// Serializes the archive to a seekable output using streaming writes.
+    ///
+    /// Content data is read on demand via `data_provider(idx)`, which receives
+    /// the entry index in URL-sorted order. This avoids buffering all entry data
+    /// in memory.
+    ///
+    /// `num_threads` controls how many clusters are compressed in parallel.
+    /// Pass 0 to use the CPU core count.
+    pub fn write_to_streaming(
+        &mut self,
+        out: &mut (impl Read + Write + Seek),
+        mut data_provider: impl FnMut(usize) -> Result<Vec<u8>>,
+        num_threads: usize,
+    ) -> Result<u64> {
+        let num_threads = if num_threads == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        } else {
+            num_threads
+        };
+
+        let (plan, cluster_entries) = self.build_plan_metadata()?;
+        if cluster_entries.is_empty() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "archive has no content entries",
+            )));
+        }
+
+        let metadata_end = plan_metadata_size(&plan, cluster_entries.len());
+
+        // Write placeholder metadata (header + sections with zero cluster ptrs)
+        write_metadata_placeholder(out, &plan, cluster_entries.len(), metadata_end)?;
+
+        // Build and write clusters, recording their actual positions
+        let cluster_positions = write_clusters(
+            out,
+            metadata_end,
+            &cluster_entries,
+            &plan.entries,
+            &mut data_provider,
+            self.no_compress,
+            num_threads,
+        )?;
+
+        let checksum_pos = cluster_positions
+            .last()
+            .map(|(_, end)| *end)
+            .unwrap_or(metadata_end);
+
+        // Backpatch cluster pointer list
+        let cluster_ptr_pos = plan.cluster_ptr_pos;
+        out.seek(SeekFrom::Start(cluster_ptr_pos))?;
+        let mut ptrs = vec![0u8; 8 * cluster_positions.len()];
+        for (i, &(start, _)) in cluster_positions.iter().enumerate() {
+            put_u64(&mut ptrs[8 * i..], start);
+        }
+        out.write_all(&ptrs)?;
+
+        // Backpatch header with checksum_pos
+        out.seek(SeekFrom::Start(0))?;
+        let mut hdr = plan.hdr;
+        hdr.checksum_pos = checksum_pos;
+        out.write_all(&hdr.marshal())?;
+
+        // Compute MD5 by reading back the file up to checksum_pos
+        out.seek(SeekFrom::Start(0))?;
+        let digest = stream_md5(out, checksum_pos)?;
+        out.seek(SeekFrom::Start(checksum_pos))?;
+        out.write_all(&digest)?;
+
+        Ok(checksum_pos + 16)
     }
 
     fn put(&mut self, e: WriterEntry) {
@@ -243,8 +386,68 @@ impl Writer {
         self.entries.push(e);
     }
 
+    fn entry_size(&self, e: &WriterEntry) -> usize {
+        if e.data.is_empty() && e.data_len > 0 {
+            e.data_len as usize
+        } else {
+            e.data.len()
+        }
+    }
+
     fn build_plan(&mut self) -> Result<Plan> {
-        let mut p = Plan::default();
+        let (plan, cluster_entries) = self.build_plan_metadata()?;
+
+        // Build cluster data from stored entries
+        let mut clusters = Vec::with_capacity(cluster_entries.len());
+        for ce in &cluster_entries {
+            let blobs: Vec<Vec<u8>> = ce
+                .blob_indices
+                .iter()
+                .map(|&bi| {
+                    let e = &plan.entries[ce.entry_indices[bi]];
+                    if e.data.is_empty() && e.data_len > 0 {
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("entry '{}' has no stored data; use write_to_streaming", e.url),
+                        )));
+                    }
+                    Ok(e.data.clone())
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let cb = ClusterBuf {
+                comp: ce.comp,
+                blobs,
+            };
+            clusters.push(cb.encode(self.no_compress, &*self.compress)?);
+        }
+
+        // Compute cluster pointer table from actual encoded sizes
+        let metadata_end = plan_metadata_size(&plan, cluster_entries.len());
+        let mut pos = metadata_end;
+        let mut cluster_ptrs = vec![0u8; 8 * clusters.len()];
+        for (i, c) in clusters.iter().enumerate() {
+            put_u64(&mut cluster_ptrs[8 * i..], pos);
+            pos += c.len() as u64;
+        }
+        let checksum_pos = pos;
+
+        let mut hdr = plan.hdr;
+        hdr.checksum_pos = checksum_pos;
+
+        Ok(Plan {
+            hdr,
+            mime_list: plan.mime_list,
+            url_ptrs: plan.url_ptrs,
+            title_ptrs: plan.title_ptrs,
+            cluster_ptrs,
+            dirents: plan.dirents,
+            clusters,
+        })
+    }
+
+    fn build_plan_metadata(&mut self) -> Result<(PlanMetadata, Vec<ClusterEntry>)> {
+        let mut plan = PlanMetadata::default();
         let mut ents = self.entries.clone();
         ents.sort_by_key(|a| key(a.namespace, &a.url));
         let mut index = HashMap::with_capacity(ents.len());
@@ -282,103 +485,286 @@ impl Writer {
             };
             e.mime_idx = idx;
         }
-        p.mime_list = encode_mime_list(&mimes);
+        plan.mime_list = encode_mime_list(&mimes);
 
-        let clusters = self.pack_clusters(&mut ents);
-        for c in &clusters {
-            p.clusters
-                .push(c.encode(self.no_compress, &*self.compress)?);
+        let cluster_entries = pack_clusters(&ents, self);
+        for (ci, ce) in cluster_entries.iter().enumerate() {
+            for (bi, &ei) in ce.blob_indices.iter().enumerate() {
+                ents[ce.entry_indices[ei]].cluster = ci as u32;
+                ents[ce.entry_indices[ei]].blob = bi as u32;
+            }
         }
 
         for e in &ents {
-            p.dirents.push(e.encode_dirent());
+            plan.dirents.push(e.encode_dirent());
         }
 
         let count = ents.len() as u32;
         let mut pos = HEADER_LEN as u64;
         let mime_list_pos = pos;
-        pos += p.mime_list.len() as u64;
+        pos += plan.mime_list.len() as u64;
         let url_ptr_pos = pos;
         pos += 8 * u64::from(count);
         let title_ptr_pos = pos;
         pos += 4 * u64::from(count);
         let cluster_ptr_pos = pos;
-        pos += 8 * p.clusters.len() as u64;
-        for (e, dirent) in ents.iter_mut().zip(&p.dirents) {
+        pos += 8 * cluster_entries.len() as u64;
+        for (e, dirent) in ents.iter_mut().zip(&plan.dirents) {
             e.position = pos;
             pos += dirent.len() as u64;
         }
-        let mut cluster_pos = Vec::with_capacity(p.clusters.len());
-        for cluster in &p.clusters {
-            cluster_pos.push(pos);
-            pos += cluster.len() as u64;
-        }
-        let checksum_pos = pos;
 
-        p.url_ptrs = vec![0; 8 * count as usize];
+        plan.url_ptrs = vec![0; 8 * count as usize];
         for (i, e) in ents.iter().enumerate() {
-            put_u64(&mut p.url_ptrs[8 * i..], e.position);
+            put_u64(&mut plan.url_ptrs[8 * i..], e.position);
         }
-        p.cluster_ptrs = vec![0; 8 * cluster_pos.len()];
-        for (i, cp) in cluster_pos.iter().enumerate() {
-            put_u64(&mut p.cluster_ptrs[8 * i..], *cp);
-        }
-        p.title_ptrs = encode_title_ptrs(&ents);
+        plan.title_ptrs = encode_title_ptrs(&ents);
 
-        p.hdr = Header {
+        plan.hdr = Header {
             uuid: derive_uuid(&ents),
             article_count: count,
-            cluster_count: p.clusters.len() as u32,
+            cluster_count: cluster_entries.len() as u32,
             url_ptr_pos,
             title_ptr_pos,
             cluster_ptr_pos,
             mime_list_pos,
             main_page: NO_MAIN_PAGE,
             layout_page: NO_MAIN_PAGE,
-            checksum_pos,
+            checksum_pos: 0, // filled later
         };
         if !self.main_key.is_empty() {
             if let Some(mi) = index.get(&self.main_key) {
-                p.hdr.main_page = *mi;
+                plan.hdr.main_page = *mi;
             }
         }
-        Ok(p)
+        plan.cluster_ptr_pos = cluster_ptr_pos;
+        plan.entries = ents;
+
+        Ok((plan, cluster_entries))
     }
+}
 
-    fn pack_clusters(&self, ents: &mut [WriterEntry]) -> Vec<ClusterBuf> {
-        let mut clusters = Vec::new();
-        let mut cur_text = None;
-        let mut cur_bin = None;
+#[derive(Default)]
+struct PlanMetadata {
+    hdr: Header,
+    mime_list: Vec<u8>,
+    url_ptrs: Vec<u8>,
+    title_ptrs: Vec<u8>,
+    dirents: Vec<Vec<u8>>,
+    cluster_ptr_pos: u64,
+    entries: Vec<WriterEntry>,
+}
 
-        for e in ents {
-            if e.redirect {
-                continue;
-            }
-            let (cur, comp) = if is_text_mime(&e.mime) {
-                (&mut cur_text, COMP_ZSTD)
-            } else {
-                (&mut cur_bin, COMP_NONE)
-            };
-            if cur.is_none() {
-                *cur = Some(clusters.len());
-                clusters.push(ClusterBuf {
-                    comp,
-                    blobs: Vec::new(),
-                    size: 0,
-                });
-            }
-            let cluster_idx = cur.expect("cluster index assigned");
-            let c = &mut clusters[cluster_idx];
-            e.cluster = cluster_idx as u32;
-            e.blob = c.blobs.len() as u32;
-            c.size += e.data.len();
-            c.blobs.push(e.data.clone());
-            if c.size >= MAX_CLUSTER_CONTENT {
-                *cur = None;
-            }
+struct ClusterEntry {
+    comp: u8,
+    /// Indices into `PlanMetadata.entries`.
+    entry_indices: Vec<usize>,
+    /// Indices into `entry_indices` for each blob in this cluster.
+    blob_indices: Vec<usize>,
+}
+
+fn pack_clusters(ents: &[WriterEntry], writer: &Writer) -> Vec<ClusterEntry> {
+    let mut clusters: Vec<ClusterEntry> = Vec::new();
+    let mut cur_text: Option<usize> = None;
+    let mut cur_bin: Option<usize> = None;
+
+    for (ei, e) in ents.iter().enumerate() {
+        if e.redirect {
+            continue;
         }
-        clusters
+        let (cur, comp) = if is_text_mime(&e.mime) {
+            (&mut cur_text, COMP_ZSTD)
+        } else {
+            (&mut cur_bin, COMP_NONE)
+        };
+        if cur.is_none() {
+            *cur = Some(clusters.len());
+            clusters.push(ClusterEntry {
+                comp,
+                entry_indices: Vec::new(),
+                blob_indices: Vec::new(),
+            });
+        }
+        let ci = cur.expect("cluster index assigned");
+        let ce = &mut clusters[ci];
+        let blob_idx = ce.blob_indices.len();
+        ce.blob_indices.push(blob_idx);
+        ce.entry_indices.push(ei);
+        let current: usize = ce.blob_indices.iter().map(|&i| writer.entry_size(&ents[ce.entry_indices[i]])).sum();
+        if current >= MAX_CLUSTER_CONTENT {
+            *cur = None;
+        }
     }
+    clusters
+}
+
+fn plan_metadata_size(plan: &PlanMetadata, cluster_count: usize) -> u64 {
+    let mut pos = HEADER_LEN as u64;
+    pos += plan.mime_list.len() as u64;
+    pos += 8 * u64::from(plan.hdr.article_count); // url ptrs
+    pos += 4 * u64::from(plan.hdr.article_count); // title ptrs
+    pos += 8 * cluster_count as u64; // cluster ptrs
+    for d in &plan.dirents {
+        pos += d.len() as u64;
+    }
+    pos
+}
+
+fn write_metadata_placeholder(
+    out: &mut (impl Write + Seek),
+    plan: &PlanMetadata,
+    cluster_count: usize,
+    metadata_end: u64,
+) -> Result<()> {
+    out.seek(SeekFrom::Start(0))?;
+
+    // Write header placeholder (checksum_pos = 0 for now)
+    out.write_all(&plan.hdr.marshal())?;
+    out.write_all(&plan.mime_list)?;
+    out.write_all(&plan.url_ptrs)?;
+    out.write_all(&plan.title_ptrs)?;
+
+    // Write zero-filled cluster pointers
+    let zero_ptrs = vec![0u8; 8 * cluster_count];
+    out.write_all(&zero_ptrs)?;
+
+    for d in &plan.dirents {
+        out.write_all(d)?;
+    }
+
+    // Zero-fill any gap between metadata end and reserved end
+    let current = out.stream_position()?;
+    if current < metadata_end {
+        let gap = vec![0u8; (metadata_end - current) as usize];
+        out.write_all(&gap)?;
+    }
+
+    Ok(())
+}
+
+fn write_clusters(
+    out: &mut (impl Write + Seek),
+    metadata_end: u64,
+    cluster_entries: &[ClusterEntry],
+    entries: &[WriterEntry],
+    data_provider: &mut impl FnMut(usize) -> Result<Vec<u8>>,
+    no_compress: bool,
+    num_threads: usize,
+) -> Result<Vec<(u64, u64)>> {
+    use std::collections::VecDeque;
+
+    out.seek(SeekFrom::Start(metadata_end))?;
+    let mut positions = Vec::with_capacity(cluster_entries.len());
+    let mut current = metadata_end;
+    let mut handles: VecDeque<std::thread::JoinHandle<Result<Vec<u8>>>> = VecDeque::new();
+
+    for (_ci, ce) in cluster_entries.iter().enumerate() {
+        // Build raw cluster data: offset table + concatenated blobs
+        let raw = build_raw_cluster(ce, entries, data_provider)?;
+        let comp = if no_compress { COMP_NONE } else { ce.comp };
+
+        let handle = std::thread::spawn(move || encode_cluster_data(comp, raw));
+        handles.push_back(handle);
+
+        if handles.len() >= num_threads {
+            let encoded = handles
+                .pop_front()
+                .unwrap()
+                .join()
+                .map_err(|_| Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "compression thread panicked",
+                )))??;
+            let start = current;
+            out.write_all(&encoded)?;
+            current += encoded.len() as u64;
+            positions.push((start, current));
+        }
+    }
+
+    for handle in handles {
+        let encoded = handle
+            .join()
+            .map_err(|_| Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "compression thread panicked",
+            )))??;
+        let start = current;
+        out.write_all(&encoded)?;
+        current += encoded.len() as u64;
+        positions.push((start, current));
+    }
+
+    Ok(positions)
+}
+
+fn build_raw_cluster(
+    ce: &ClusterEntry,
+    entries: &[WriterEntry],
+    data_provider: &mut impl FnMut(usize) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let num_blobs = ce.entry_indices.len();
+    let table_len = 4 * (num_blobs + 1);
+    let mut sizes = Vec::with_capacity(num_blobs);
+    let mut total = table_len;
+
+    for &ei in &ce.entry_indices {
+        let e = &entries[ei];
+        let size = if e.data.is_empty() && e.data_len > 0 {
+            e.data_len as usize
+        } else {
+            e.data.len()
+        };
+        sizes.push(size);
+        total += size;
+    }
+
+    let mut data = vec![0u8; total];
+    put_u32(&mut data[0..4], table_len as u32);
+    let mut off = table_len as u32;
+    for (i, &size) in sizes.iter().enumerate() {
+        off += size as u32;
+        put_u32(&mut data[4 * (i + 1)..4 * (i + 2)], off);
+    }
+
+    for (bi, &ei) in ce.entry_indices.iter().enumerate() {
+        let e = &entries[ei];
+        let blob = if e.data.is_empty() && e.data_len > 0 {
+            data_provider(ei)?
+        } else {
+            e.data.clone()
+        };
+        let start = table_len + sizes[..bi].iter().sum::<usize>();
+        data[start..start + blob.len()].copy_from_slice(&blob);
+    }
+
+    Ok(data)
+}
+
+fn encode_cluster_data(comp: u8, raw: Vec<u8>) -> Result<Vec<u8>> {
+    let payload = if comp == COMP_ZSTD {
+        zstd_encode(&raw)?
+    } else {
+        raw
+    };
+    let mut out = Vec::with_capacity(payload.len() + 1);
+    out.push(comp);
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+fn stream_md5(out: &mut (impl Read + Write + Seek), checksum_pos: u64) -> Result<[u8; 16]> {
+    let mut ctx = md5::Context::new();
+    let mut remaining = checksum_pos;
+    let mut buf = vec![0u8; 64 * 1024];
+    while remaining > 0 {
+        let n = remaining.min(buf.len() as u64) as usize;
+        let chunk = &mut buf[..n];
+        out.read_exact(chunk)?;
+        ctx.consume(chunk);
+        remaining -= n as u64;
+    }
+    Ok(ctx.finalize().0)
 }
 
 impl ClusterBuf {
@@ -466,9 +852,16 @@ fn derive_uuid(ents: &[WriterEntry]) -> [u8; 16] {
     let mut n = [0; 8];
     for e in ents {
         body.extend_from_slice(key(e.namespace, &e.url).as_bytes());
-        n.copy_from_slice(&(e.data.len() as u64).to_le_bytes());
+        let len = if e.data.is_empty() && e.data_len > 0 {
+            e.data_len
+        } else {
+            e.data.len() as u64
+        };
+        n.copy_from_slice(&len.to_le_bytes());
         body.extend_from_slice(&n);
-        body.extend_from_slice(&e.data);
+        if !e.data.is_empty() {
+            body.extend_from_slice(&e.data);
+        }
     }
     md5(&body)
 }

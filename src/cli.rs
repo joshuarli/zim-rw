@@ -1,5 +1,5 @@
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -17,24 +17,56 @@ fn main() {
 }
 
 fn run() -> CliResult<()> {
-    let mut args = env::args().skip(1);
-    match (args.next().as_deref(), args.next(), args.next()) {
-        (Some("build"), Some(root), None) => {
-            let output = build_archive(Path::new(&root))?;
+    let args: Vec<String> = env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("build") => {
+            let (root, out) = parse_build_args(&args[1..])?;
+            let output = build_archive(Path::new(&root), out.as_deref())?;
             println!("{}", output.display());
             Ok(())
         }
-        (Some("serve"), Some(path), None) => serve_archive(Path::new(&path)),
+        Some("serve") if args.len() == 2 => serve_archive(Path::new(&args[1])),
         _ => {
             eprintln!("usage:");
-            eprintln!("  zim build <rootdir>");
+            eprintln!("  zim build <rootdir> [-o|--out <file.zim>]");
             eprintln!("  zim serve <file.zim>");
             std::process::exit(2);
         }
     }
 }
 
-fn build_archive(root: &Path) -> CliResult<PathBuf> {
+fn parse_build_args(args: &[String]) -> CliResult<(String, Option<PathBuf>)> {
+    let mut root: Option<String> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--out" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value for -o/--out".into());
+                }
+                out = Some(PathBuf::from(&args[i]));
+            }
+            arg if arg.starts_with('-') => {
+                return Err(format!("unknown flag: {arg}").into());
+            }
+            arg => {
+                if root.is_some() {
+                    return Err(format!("unexpected argument: {arg}").into());
+                }
+                root = Some(arg.to_owned());
+            }
+        }
+        i += 1;
+    }
+    match root {
+        Some(root) => Ok((root, out)),
+        None => Err("missing <rootdir> argument".into()),
+    }
+}
+
+fn build_archive(root: &Path, out: Option<&Path>) -> CliResult<PathBuf> {
     if !root.is_dir() {
         return Err(format!("{} is not a directory", root.display()).into());
     }
@@ -48,8 +80,8 @@ fn build_archive(root: &Path) -> CliResult<PathBuf> {
 
     let mut writer = Writer::new();
     for (url, path) in &files {
-        let data = fs::read(path)?;
-        writer.add_content(NAMESPACE_CONTENT, url, "", mime_for_path(path), data);
+        let size = fs::metadata(path)?.len();
+        writer.add_entry(NAMESPACE_CONTENT, url, "", mime_for_path(path), size);
     }
 
     let main_url = files
@@ -68,10 +100,47 @@ fn build_archive(root: &Path) -> CliResult<PathBuf> {
     );
     writer.set_main_page(NAMESPACE_WELL_KNOWN, "mainPage");
 
-    let output = output_path_for_root(root)?;
-    let mut file = File::create(&output)?;
-    writer.write_to(&mut file)?;
+    let output = match out {
+        Some(path) => path.to_path_buf(),
+        None => output_path_for_root(root)?,
+    };
+
+    let path_refs: Vec<&PathBuf> = files.iter().map(|(_, p)| p).collect();
+    let total = files.len();
+    let mut packed = 0usize;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&output)?;
+    writer.write_to_streaming(
+        &mut file,
+        |idx| {
+            let data = fs::read(path_refs[idx])?;
+            packed += 1;
+            progress(packed, total, &files[idx].0);
+            Ok(data)
+        },
+        0,
+    )?;
+    eprint!("\r\x1b[K");
+    let _ = io::stderr().flush();
+    eprintln!("wrote {} files to {}", files.len(), output.display());
     Ok(output)
+}
+
+fn progress(n: usize, total: usize, label: &str) {
+    let w = 20;
+    let filled = if total == 0 { 0 } else { n * w / total };
+    let mut bar = String::with_capacity(w + 2);
+    bar.push('[');
+    for i in 0..w {
+        bar.push(if i < filled { '=' } else if i == filled { '>' } else { ' ' });
+    }
+    bar.push(']');
+    eprint!("\r\x1b[K  {bar} {n}/{total} {label}");
+    let _ = io::stderr().flush();
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> io::Result<()> {
