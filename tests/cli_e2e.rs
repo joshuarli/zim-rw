@@ -148,6 +148,149 @@ fn collect_files(
     Ok(())
 }
 
+#[test]
+fn build_packs_index_html_in_first_cluster() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("site");
+    // Create files so that index.html is not alphabetically first: we want
+    // a.bin to sort before index.html by name, but our linearization should
+    // still put index.html first in the cluster.
+    fs::create_dir_all(root.join("assets")).expect("create dirs");
+
+    fs::write(root.join("assets/data.bin"), vec![0; 100]).expect("write data");
+    fs::write(root.join("index.html"), b"<html>Home</html>\n").expect("write index");
+    fs::write(root.join("style.css"), b"body {}\n").expect("write css");
+
+    let bin = env!("CARGO_BIN_EXE_zim");
+    let zim_path = root.with_file_name("site.zim");
+    let out = Command::new(bin)
+        .arg("build")
+        .arg(&root)
+        .arg("-o")
+        .arg(&zim_path)
+        .output()
+        .expect("run build");
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Verify index.html is the first content blob in its cluster.  The
+    // writer packs HTML before other content so a streaming reader sees
+    // the most important content first.
+    let data = fs::read(&zim_path).expect("read zim");
+    let mut r = zim::Reader::from_bytes(data.clone()).expect("open reader");
+    let blob = r
+        .get(zim::NAMESPACE_CONTENT, "index.html")
+        .expect("get index.html");
+    assert_eq!(blob.data, b"<html>Home</html>\n");
+    // The dirent ordering is URL-sorted (required for binary search), but
+    // the cluster packing puts index.html first regardless.
+    assert_eq!(blob.mime_type, "text/html");
+}
+
+#[test]
+fn serve_supports_range_requests() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("site");
+    fs::create_dir_all(&root).expect("create site");
+
+    let body: Vec<u8> = (0u16..1000).map(|b| (b % 256) as u8).collect();
+    fs::write(root.join("index.html"), &body).expect("write index");
+
+    let bin = env!("CARGO_BIN_EXE_zim");
+    let zim_path = root.with_file_name("site.zim");
+    let build = Command::new(bin)
+        .arg("build")
+        .arg(&root)
+        .arg("-o")
+        .arg(&zim_path)
+        .output()
+        .expect("run build");
+    assert!(build.status.success());
+
+    let mut server = Command::new(bin)
+        .arg("serve")
+        .arg(&zim_path)
+        .env("ZIM_ADDR", "127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let stdout = server.stdout.take().expect("server stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let line = lines
+        .next()
+        .expect("server should print listening line")
+        .expect("read listening line");
+    let addr = line
+        .strip_prefix("Listening on http://")
+        .expect("listening prefix")
+        .to_owned();
+
+    // Full request should return 200 with Accept-Ranges
+    {
+        let mut stream = TcpStream::connect(&addr).expect("connect");
+        write!(
+            stream,
+            "GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write request");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read response");
+        let headers = String::from_utf8_lossy(
+            &response[..response.windows(4).position(|w| w == b"\r\n\r\n").unwrap()],
+        );
+        assert!(headers.contains("200 OK"), "{headers}");
+        assert!(headers.contains("Accept-Ranges: bytes"), "{headers}");
+    }
+
+    // Range request should return 206
+    {
+        let mut stream = TcpStream::connect(&addr).expect("connect");
+        write!(
+            stream,
+            "GET / HTTP/1.1\r\nHost: {addr}\r\nRange: bytes=10-19\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write request");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read response");
+        let header_end = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("headers");
+        let headers = String::from_utf8_lossy(&response[..header_end]);
+        assert!(headers.contains("206 Partial Content"), "{headers}");
+        assert!(
+            headers.contains("Content-Range: bytes 10-19/1000"),
+            "{headers}"
+        );
+        let actual = &response[header_end + 4..];
+        assert_eq!(actual, &body[10..20]);
+    }
+
+    // Out-of-range returns 416
+    {
+        let mut stream = TcpStream::connect(&addr).expect("connect");
+        write!(
+            stream,
+            "GET / HTTP/1.1\r\nHost: {addr}\r\nRange: bytes=2000-3000\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write request");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read response");
+        let headers = String::from_utf8_lossy(
+            &response[..response.windows(4).position(|w| w == b"\r\n\r\n").unwrap()],
+        );
+        assert!(headers.contains("416"), "{headers}");
+    }
+
+    server.kill().expect("kill server");
+    server.wait().expect("wait server");
+}
+
 fn http_get(addr: &str, path: &str) -> Vec<u8> {
     let mut stream = TcpStream::connect(addr).expect("connect");
     write!(

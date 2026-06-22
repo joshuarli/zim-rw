@@ -1,4 +1,3 @@
-use std::io::Cursor;
 use zim::{NAMESPACE_CONTENT, NAMESPACE_METADATA, NAMESPACE_WELL_KNOWN, Reader, Writer};
 
 fn build_sample(no_compress: bool) -> Vec<u8> {
@@ -46,7 +45,7 @@ fn build_sample(no_compress: bool) -> Vec<u8> {
 fn round_trip() {
     for no_compress in [false, true] {
         let data = build_sample(no_compress);
-        let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("new reader");
+        let mut r = Reader::from_bytes(data.clone()).expect("new reader");
 
         let home = r.get(NAMESPACE_CONTENT, "index.html").expect("get home");
         assert!(String::from_utf8_lossy(&home.data).starts_with("<h1>Home</h1>"));
@@ -74,7 +73,7 @@ fn round_trip() {
 #[test]
 fn entry_iteration_preserves_redirects() {
     let data = build_sample(true);
-    let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("new reader");
+    let mut r = Reader::from_bytes(data.clone()).expect("new reader");
     let mut saw_redirect = false;
 
     for idx in 0..r.count() {
@@ -98,13 +97,13 @@ fn checksum() {
     let (body, sum) = data.split_at(data.len() - 16);
     assert_eq!(sum, md5::compute(body).0);
 
-    let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("new reader");
+    let r = Reader::from_bytes(data.clone()).expect("new reader");
     assert!(r.check().expect("check archive"));
 
     let mut bad = data;
     let last = bad.len() - 1;
     bad[last] ^= 0xff;
-    let mut r = Reader::new(Cursor::new(bad.clone()), bad.len() as u64).expect("new reader");
+    let r = Reader::from_bytes(bad.clone()).expect("new reader");
     assert!(!r.check().expect("check archive"));
 }
 
@@ -144,7 +143,7 @@ fn unicode_and_empty_blobs_round_trip() {
 
     let mut data = Vec::new();
     w.write_to(&mut data).expect("write archive");
-    let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("new reader");
+    let mut r = Reader::from_bytes(data.clone()).expect("new reader");
     let blob = r.get(NAMESPACE_CONTENT, "L\u{fc}liang").expect("get blob");
     assert_eq!(blob.title, "\u{dc}bersicht");
     assert!(blob.data.is_empty());
@@ -171,7 +170,7 @@ fn duplicate_content_replaces_previous_entry() {
 
     let mut data = Vec::new();
     w.write_to(&mut data).expect("write archive");
-    let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("new reader");
+    let mut r = Reader::from_bytes(data.clone()).expect("new reader");
 
     assert_eq!(r.count(), 3); // 1 content + Counter + listing
     let blob = r.get(NAMESPACE_CONTENT, "same").expect("get blob");
@@ -201,23 +200,32 @@ fn missing_redirect_target_is_write_error() {
 fn invalid_headers_return_errors() {
     let data = build_sample(true);
 
-    assert!(Reader::new(Cursor::new(vec![0; 8]), 8).is_err());
+    assert!(Reader::from_bytes(vec![0; 8]).is_err());
 
     let mut bad_magic = data.clone();
     bad_magic[0] = 0;
-    assert!(Reader::new(Cursor::new(bad_magic.clone()), bad_magic.len() as u64).is_err());
+    assert!(Reader::from_bytes(bad_magic.clone()).is_err());
 
     let mut bad_version = data;
     bad_version[4..6].copy_from_slice(&7u16.to_le_bytes());
-    assert!(Reader::new(Cursor::new(bad_version.clone()), bad_version.len() as u64).is_err());
+    assert!(Reader::from_bytes(bad_version.clone()).is_err());
 }
 
 #[test]
 fn truncated_archive_lookup_returns_error() {
     let mut data = build_sample(true);
-    let checksum_pos = u64::from_le_bytes(data[72..80].try_into().unwrap()) as usize;
-    data.truncate(checksum_pos - 1);
-    let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("new reader");
+    // Truncate just past the dirents so the cluster pointer table and header
+    // are intact, but cluster data is missing.
+    let cluster_ptr_pos = u64::from_le_bytes(data[48..56].try_into().unwrap()) as usize;
+    let c0_start = u64::from_le_bytes(
+        data[cluster_ptr_pos..cluster_ptr_pos + 8]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    // Truncate right at the start of the first cluster — the pointer table
+    // points there but there's no data.
+    data.truncate(c0_start);
+    let mut r = Reader::from_bytes(data.clone()).expect("new reader");
 
     assert!(r.get(NAMESPACE_CONTENT, "index.html").is_err());
 }
@@ -286,7 +294,7 @@ fn reads_extended_cluster_offsets() {
     let digest = md5::compute(&data[..new_checksum_pos]).0;
     data[new_checksum_pos..].copy_from_slice(&digest);
 
-    let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("new reader");
+    let mut r = Reader::from_bytes(data.clone()).expect("new reader");
     let blob = r.get(NAMESPACE_CONTENT, "a").expect("get extended blob");
     assert_eq!(blob.data, b"alpha");
 }
@@ -316,7 +324,7 @@ fn reads_old_zero_compression_as_uncompressed() {
     let digest = md5::compute(&data[..checksum_pos]).0;
     data[checksum_pos..].copy_from_slice(&digest);
 
-    let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("new reader");
+    let mut r = Reader::from_bytes(data.clone()).expect("new reader");
     let blob = r.get(NAMESPACE_CONTENT, "a").expect("get blob");
     assert_eq!(blob.data, b"alpha");
 }
@@ -350,7 +358,7 @@ fn title_lookup_works() {
     let mut data = Vec::new();
     w.write_to(&mut data).expect("write");
 
-    let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("reader");
+    let mut r = Reader::from_bytes(data.clone()).expect("reader");
 
     let blob = r.get_by_title(0, "About Us").expect("get_by_title");
     assert_eq!(blob.url, "about.html");
@@ -393,7 +401,7 @@ fn counter_and_listing_are_generated() {
     let mut data = Vec::new();
     w.write_to(&mut data).expect("write");
 
-    let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("reader");
+    let mut r = Reader::from_bytes(data.clone()).expect("reader");
 
     // M/Counter should be auto-generated
     let counter = r.get(NAMESPACE_METADATA, "Counter").expect("Counter");
@@ -423,10 +431,143 @@ fn illustration_round_trips() {
     let mut data = Vec::new();
     w.write_to(&mut data).expect("write");
 
-    let mut r = Reader::new(Cursor::new(data.clone()), data.len() as u64).expect("reader");
+    let mut r = Reader::from_bytes(data.clone()).expect("reader");
     let blob = r
         .get(NAMESPACE_METADATA, "Illustration_48x48@1")
         .expect("illustration");
     assert_eq!(blob.data, vec![1, 2, 3, 4]);
     assert_eq!(blob.mime_type, "image/png");
+}
+
+#[test]
+fn cache_limit_api() {
+    // Build a small archive with two content entries that land in separate
+    // clusters (text vs binary) so we can test eviction.
+    let mut w = Writer::new();
+    w.set_no_compress(true);
+    w.add_content(
+        NAMESPACE_CONTENT,
+        "index.html",
+        "Home",
+        "text/html",
+        b"<h1>Home</h1>".to_vec(),
+    );
+    w.add_content(
+        NAMESPACE_CONTENT,
+        "logo.png",
+        "",
+        "image/png",
+        vec![0x89, b'P', b'N', b'G', 0, 1],
+    );
+
+    let mut data = Vec::new();
+    w.write_to(&mut data).expect("write");
+
+    let mut r = Reader::from_bytes(data.clone()).expect("reader");
+
+    assert_eq!(r.cache_limit(), 64);
+    r.set_cache_limit(1);
+    assert_eq!(r.cache_limit(), 1);
+
+    // Read HTML (text cluster), then binary (binary cluster).  The second
+    // read triggers eviction of the first cluster.
+    let blob = r.get(NAMESPACE_CONTENT, "index.html").expect("index");
+    assert_eq!(blob.data, b"<h1>Home</h1>");
+
+    let blob = r.get(NAMESPACE_CONTENT, "logo.png").expect("logo");
+    assert_eq!(blob.data, vec![0x89, b'P', b'N', b'G', 0, 1]);
+
+    // Re-read first page — must survive eviction and return correct data
+    let blob = r.get(NAMESPACE_CONTENT, "index.html").expect("index again");
+    assert_eq!(blob.data, b"<h1>Home</h1>");
+
+    // Unbounded (0) must also work
+    r.set_cache_limit(0);
+    assert_eq!(r.cache_limit(), 0);
+    let blob = r
+        .get(NAMESPACE_CONTENT, "logo.png")
+        .expect("logo unbounded");
+    assert_eq!(blob.data, vec![0x89, b'P', b'N', b'G', 0, 1]);
+}
+
+#[test]
+fn get_range_compressed() {
+    let data = build_sample(false);
+    let mut r = Reader::from_bytes(data).expect("reader");
+
+    // Read a sub-range of the HTML content
+    let (slice, total) = r
+        .get_range(NAMESPACE_CONTENT, "index.html", 4, 10)
+        .expect("get_range");
+    let home_bytes: Vec<u8> = format!("<h1>Home</h1>{}", " word".repeat(500)).into_bytes();
+    assert_eq!(total as usize, home_bytes.len());
+    assert_eq!(slice, &home_bytes[4..14]);
+
+    // Read an empty range (zero length)
+    let (slice, total) = r
+        .get_range(NAMESPACE_CONTENT, "index.html", 0, 0)
+        .expect("empty range");
+    assert_eq!(total as usize, home_bytes.len());
+    assert!(slice.is_empty());
+
+    // Read from the end of the blob
+    let (slice, _) = r
+        .get_range(
+            NAMESPACE_CONTENT,
+            "index.html",
+            home_bytes.len() as u64 - 5,
+            100,
+        )
+        .expect("range from end");
+    assert_eq!(slice.len(), 5);
+    assert_eq!(slice, &home_bytes[home_bytes.len() - 5..]);
+}
+
+#[test]
+fn get_range_uncompressed() {
+    let mut w = Writer::new();
+    w.set_no_compress(true);
+    w.add_content(
+        NAMESPACE_CONTENT,
+        "data.bin",
+        "",
+        "application/octet-stream",
+        (0u8..200).collect::<Vec<u8>>(),
+    );
+
+    let mut buf = Vec::new();
+    w.write_to(&mut buf).expect("write");
+    let mut r = Reader::from_bytes(buf).expect("reader");
+
+    let (slice, total) = r
+        .get_range(NAMESPACE_CONTENT, "data.bin", 10, 20)
+        .expect("get_range");
+    assert_eq!(total, 200);
+    assert_eq!(slice.len(), 20);
+    assert_eq!(slice, (10u8..30).collect::<Vec<u8>>());
+}
+
+#[test]
+fn get_range_through_redirect() {
+    let data = build_sample(false);
+    let mut r = Reader::from_bytes(data).expect("reader");
+
+    // W/mainPage redirects to C/index.html
+    let (slice, total) = r
+        .get_range(NAMESPACE_WELL_KNOWN, "mainPage", 0, 4)
+        .expect("get_range through redirect");
+    let home_bytes: Vec<u8> = format!("<h1>Home</h1>{}", " word".repeat(500)).into_bytes();
+    assert_eq!(total as usize, home_bytes.len());
+    assert_eq!(slice, &home_bytes[..4]);
+}
+
+#[test]
+fn get_range_not_found() {
+    let data = build_sample(false);
+    let mut r = Reader::from_bytes(data).expect("reader");
+
+    let err = r
+        .get_range(NAMESPACE_CONTENT, "nonexistent", 0, 10)
+        .expect_err("should not find");
+    assert!(err.is_not_found());
 }

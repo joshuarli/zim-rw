@@ -104,6 +104,22 @@ Consider an API for multiple URLs sharing one blob without duplicating data.
 - `add_alias(namespace, url, title, target_namespace, target_url)`
 - Should create a normal item entry pointing at the target's cluster/blob, not a redirect.
 
+## Content Deduplication (Content-Addressed Blobs)
+
+The ZIM format already allows multiple dirents to point at the same
+cluster + blob.  The writer could hash blobs and reuse identical ones from
+the same cluster, which would transparently deduplicate assets shared
+across different URL paths (same JS/CSS/image included under multiple
+names).
+
+- Hash each incoming blob (SHA-256 or similar).
+- Maintain a `HashMap<Hash, (cluster, blob)>` during cluster packing.
+- If a blob's hash matches a previously written blob in the same cluster,
+  point the dirent at the existing cluster/blob instead of writing a copy.
+- This stays within the ZIM format — readers need no changes.
+- Inspired by Gwtar's note that content-addressed naming enables
+  deduplication across archives.
+
 ## Extended Cluster Offsets for Large Archives
 
 When a cluster's uncompressed size exceeds `u32::MAX`, automatically emit

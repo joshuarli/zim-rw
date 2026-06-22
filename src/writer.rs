@@ -434,12 +434,10 @@ impl Writer {
                 .map(|&bi| {
                     let e = &plan.entries[ce.entry_indices[bi]];
                     if e.data.is_empty() && e.data_len > 0 {
-                        return Err(Error::Io(std::io::Error::other(
-                            format!(
-                                "entry '{}' has no stored data; use write_to_streaming",
-                                e.url
-                            ),
-                        )));
+                        return Err(Error::Io(std::io::Error::other(format!(
+                            "entry '{}' has no stored data; use write_to_streaming",
+                            e.url
+                        ))));
                     }
                     Ok(e.data.clone())
                 })
@@ -617,9 +615,10 @@ impl Writer {
             checksum_pos: 0, // filled later
         };
         if !self.main_key.is_empty()
-            && let Some(mi) = index.get(&self.main_key) {
-                plan.hdr.main_page = *mi;
-            }
+            && let Some(mi) = index.get(&self.main_key)
+        {
+            plan.hdr.main_page = *mi;
+        }
         plan.cluster_ptr_pos = cluster_ptr_pos;
         plan.entries = ents;
 
@@ -647,14 +646,22 @@ struct ClusterEntry {
 }
 
 fn pack_clusters(ents: &[WriterEntry], writer: &Writer) -> Vec<ClusterEntry> {
+    // Build a packing order that puts important content first.  HTML pages
+    // and CSS land in early clusters so a reader that stops early sees
+    // usable content sooner.
+    let mut order: Vec<usize> = (0..ents.len()).filter(|&i| !ents[i].redirect).collect();
+    order.sort_by(|&a, &b| {
+        pack_priority(&ents[a])
+            .cmp(&pack_priority(&ents[b]))
+            .then(a.cmp(&b))
+    });
+
     let mut clusters: Vec<ClusterEntry> = Vec::new();
     let mut cur_text: Option<usize> = None;
     let mut cur_bin: Option<usize> = None;
 
-    for (ei, e) in ents.iter().enumerate() {
-        if e.redirect {
-            continue;
-        }
+    for &ei in &order {
+        let e = &ents[ei];
         let (cur, comp) = if is_text_mime(&e.mime) {
             (&mut cur_text, COMP_ZSTD)
         } else {
@@ -683,6 +690,19 @@ fn pack_clusters(ents: &[WriterEntry], writer: &Writer) -> Vec<ClusterEntry> {
         }
     }
     clusters
+}
+
+/// Lower score = packed into earlier clusters.  HTML first (even before
+/// same-cluster text siblings), then CSS, then everything else.
+fn pack_priority(e: &WriterEntry) -> u32 {
+    if e.mime.starts_with("text/html") || e.mime == "application/xhtml+xml" {
+        return 0;
+    }
+    if e.mime == "text/css" {
+        return 1;
+    }
+    // Shallower URLs before deeper ones so root assets load early.
+    2 + e.url.matches('/').count().min(255) as u32
 }
 
 fn plan_metadata_size(plan: &PlanMetadata, cluster_count: usize) -> u64 {
@@ -729,6 +749,7 @@ fn write_metadata_placeholder(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_clusters(
     out: &mut (impl Write + Seek),
     metadata_end: u64,
@@ -755,11 +776,10 @@ fn write_clusters(
         handles.push_back(handle);
 
         if handles.len() >= num_threads {
-            let encoded = handles.pop_front().unwrap().join().map_err(|_| {
-                Error::Io(std::io::Error::other(
-                    "compression thread panicked",
-                ))
-            })??;
+            let encoded =
+                handles.pop_front().unwrap().join().map_err(|_| {
+                    Error::Io(std::io::Error::other("compression thread panicked"))
+                })??;
             let start = current;
             out.write_all(&encoded)?;
             current += encoded.len() as u64;
@@ -768,11 +788,9 @@ fn write_clusters(
     }
 
     for handle in handles {
-        let encoded = handle.join().map_err(|_| {
-            Error::Io(std::io::Error::other(
-                "compression thread panicked",
-            ))
-        })??;
+        let encoded = handle
+            .join()
+            .map_err(|_| Error::Io(std::io::Error::other("compression thread panicked")))??;
         let start = current;
         out.write_all(&encoded)?;
         current += encoded.len() as u64;

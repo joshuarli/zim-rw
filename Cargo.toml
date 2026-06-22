@@ -14,6 +14,7 @@ path = "src/cli.rs"
 [dependencies]
 md5 = "0.8.0"
 memchr = "2.8.2"
+memmap2 = "0.9"
 rustc-hash = "2.1"
 walkdir = "2.5.0"
 zstd = "0.13"
